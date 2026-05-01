@@ -1,0 +1,272 @@
+// src/engine.rs — Phase 2 complete
+// Fix: removed corrupted 4th Jito tip address (was 45 chars, decoded to wrong size)
+// Using only 3 verified tip accounts.
+
+use anyhow::{anyhow, Result};
+use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::{
+    commitment_config::CommitmentConfig,
+    compute_budget::ComputeBudgetInstruction,
+    instruction::Instruction,
+    message::{v0::Message, VersionedMessage},
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+    system_instruction,
+    transaction::VersionedTransaction,
+};
+use reqwest::Client;
+use serde_json::json;
+use std::str::FromStr;
+use std::sync::Arc;
+use parking_lot::RwLock;
+
+use crate::{
+    config::BotConfig,
+    dex::{pumpfun::{self, TokenProgram}, raydium},
+    utils,
+};
+
+// ── 3 verified Jito tip accounts (all confirmed 43-44 char base58) ─────────
+const JITO_TIP_ACCOUNTS: &[&str] = &[
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+];
+
+const JITO_REGIONS: &[&str] = &[
+    "https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles",
+    "https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/bundles",
+    "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles",
+    "https://tokyo.mainnet.block-engine.jito.wtf/api/v1/bundles",
+];
+
+pub struct TradingEngine {
+    pub rpc:          RpcClient,
+    pub http:         Client,
+    pub config:       BotConfig,
+    fee_recipient:    Arc<RwLock<Pubkey>>,
+}
+
+impl TradingEngine {
+    pub fn new(config: BotConfig) -> Self {
+        let rpc = RpcClient::new_with_commitment(
+            config.rpc_url.clone(), CommitmentConfig::confirmed(),
+        );
+        let http = Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build().expect("reqwest client");
+        let fallback = Pubkey::from_str(pumpfun::FEE_RECIPIENT_FALLBACK).unwrap();
+        Self { rpc, http, config, fee_recipient: Arc::new(RwLock::new(fallback)) }
+    }
+
+    pub async fn init(&self) {
+        match pumpfun::fetch_fee_recipient(&self.rpc).await {
+            Ok(pk) => {
+                *self.fee_recipient.write() = pk;
+                tracing::info!("✓ Fee recipient: {}", pk);
+            }
+            Err(e) => tracing::warn!("Fee recipient fallback ({})", e),
+        }
+    }
+
+    fn fee_recip(&self) -> Pubkey { *self.fee_recipient.read() }
+
+    // ── Pump.fun buy ──────────────────────────────────────────────────────
+    pub async fn pump_buy(
+        &self,
+        keypair:      &Keypair,
+        mint:         &Pubkey,
+        token_amount: u64,
+        max_sol_cost: u64,
+    ) -> Result<String> {
+        let payer = keypair.pubkey();
+        let tok   = pumpfun::detect_token_program(&self.rpc, mint).await;
+        let fee   = self.fee_recip();
+
+        tracing::info!("BUY {}… tokens={} max={:.4}SOL [{}]",
+            utils::short_key(mint), token_amount,
+            utils::lamports_to_sol(max_sol_cost), tok.label());
+
+        let mut ixs = self.base_compute_ixs();
+
+        // Create ATA with the correct token program
+        ixs.push(
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &payer, &payer, mint,
+                &utils::to_spl_pubkey(&tok.pubkey()),
+            )
+        );
+
+        ixs.push(pumpfun::build_buy_instruction(
+            &payer, mint, token_amount, max_sol_cost, tok, &fee,
+        ));
+        ixs.push(self.jito_tip_ix(&payer));
+
+        self.simulate_and_send(keypair, &ixs).await
+    }
+
+    // ── Pump.fun sell ─────────────────────────────────────────────────────
+    pub async fn pump_sell(
+        &self,
+        keypair:        &Keypair,
+        mint:           &Pubkey,
+        token_amount:   u64,
+        min_sol_output: u64,
+    ) -> Result<String> {
+        let payer = keypair.pubkey();
+        let tok   = pumpfun::detect_token_program(&self.rpc, mint).await;
+        let fee   = self.fee_recip();
+
+        tracing::info!("SELL {}… tokens={} min={:.4}SOL [{}]",
+            utils::short_key(mint), token_amount,
+            utils::lamports_to_sol(min_sol_output), tok.label());
+
+        let mut ixs = self.base_compute_ixs();
+        ixs.push(pumpfun::build_sell_instruction(
+            &payer, mint, token_amount, min_sol_output, tok, &fee,
+        ));
+        ixs.push(self.jito_tip_ix(&payer));
+
+        self.simulate_and_send(keypair, &ixs).await
+    }
+
+    // ── Raydium swap — post-graduation ────────────────────────────────────
+    pub async fn raydium_swap(
+        &self,
+        keypair:        &Keypair,
+        mint_str:       &str,
+        amount_in:      u64,
+        min_amount_out: u64,
+        is_buy:         bool,
+    ) -> Result<String> {
+        let payer = keypair.pubkey();
+
+        tracing::info!("RAYDIUM {} {}… in={} min_out={}",
+            if is_buy { "BUY" } else { "SELL" },
+            &mint_str[..8.min(mint_str.len())],
+            amount_in, min_amount_out);
+
+        let pool = raydium::fetch_pool_for_mint(&self.rpc, &self.http, mint_str).await?;
+        let mint = Pubkey::from_str(mint_str)?;
+
+        let wsol = Pubkey::from_str(raydium::SOL_MINT).unwrap();
+        let (user_source, user_dest) = if is_buy {
+            (utils::get_ata(&payer, &wsol), utils::get_ata(&payer, &mint))
+        } else {
+            (utils::get_ata(&payer, &mint), utils::get_ata(&payer, &wsol))
+        };
+
+        let mut ixs = self.base_compute_ixs();
+
+        if is_buy {
+            let spl_pid = Pubkey::from_str(&spl_token::id().to_string()).unwrap();
+            ixs.push(
+                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                    &payer, &payer, &mint, &spl_pid,
+                )
+            );
+        }
+
+        ixs.push(raydium::build_swap_instruction(
+            &pool, &payer, &user_source, &user_dest, amount_in, min_amount_out,
+        ));
+        ixs.push(self.jito_tip_ix(&payer));
+
+        self.simulate_and_send(keypair, &ixs).await
+    }
+
+    // ── Token balance — tries both token programs ─────────────────────────
+    pub async fn token_balance(&self, owner: &Pubkey, mint: &Pubkey) -> Result<u64> {
+        for tok in [TokenProgram::Legacy, TokenProgram::Token2022] {
+            let ata = utils::get_ata_with_program(owner, mint, &tok.pubkey());
+            if let Ok(bal) = self.rpc.get_token_account_balance(&ata).await {
+                let amount = bal.amount.parse::<u64>().unwrap_or(0);
+                if amount > 0 { return Ok(amount); }
+            }
+        }
+        Ok(0)
+    }
+
+    pub async fn sol_balance(&self, wallet: &Pubkey) -> Result<u64> {
+        self.rpc.get_balance(wallet).await
+            .map_err(|e| anyhow!("get_balance: {}", e))
+    }
+
+    // ── Core: simulate → sign → Jito ─────────────────────────────────────
+    pub async fn simulate_and_send(
+        &self,
+        keypair: &Keypair,
+        ixs:     &[Instruction],
+    ) -> Result<String> {
+        let payer     = keypair.pubkey();
+        let blockhash = self.rpc.get_latest_blockhash().await
+            .map_err(|e| anyhow!("get_latest_blockhash: {}", e))?;
+        let message   = Message::try_compile(&payer, ixs, &[], blockhash)
+            .map_err(|e| anyhow!("compile: {}", e))?;
+        let tx        = VersionedTransaction::try_new(VersionedMessage::V0(message), &[keypair])
+            .map_err(|e| anyhow!("sign: {}", e))?;
+
+        let sim = self.rpc.simulate_transaction(&tx).await
+            .map_err(|e| anyhow!("simulate: {}", e))?;
+        if let Some(err) = sim.value.err {
+            let logs = sim.value.logs.unwrap_or_default();
+            tracing::error!("SIMULATION FAILED: {:?}", err);
+            for log in &logs { tracing::error!("  {}", log); }
+            return Err(anyhow!("Simulation failed: {:?}\n{}", err, logs.join("\n")));
+        }
+        tracing::debug!("Simulation passed ✓");
+
+        let sig    = tx.signatures[0].to_string();
+        let raw    = bincode::serialize(&tx).map_err(|e| anyhow!("serialize: {}", e))?;
+        let b58_tx = bs58::encode(&raw).into_string();
+
+        if self.config.jito.enabled {
+            self.send_jito_bundle(&b58_tx).await?;
+        } else {
+            self.rpc.send_transaction(&tx).await
+                .map_err(|e| anyhow!("send_transaction: {}", e))?;
+        }
+
+        tracing::info!("TX: https://solscan.io/tx/{}", sig);
+        Ok(sig)
+    }
+
+    async fn send_jito_bundle(&self, b58_tx: &str) -> Result<()> {
+        let payload = json!({"jsonrpc":"2.0","id":1,"method":"sendBundle","params":[[b58_tx]]});
+        for url in JITO_REGIONS {
+            if let Ok(resp) = self.http.post(*url).json(&payload).send().await {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if body.get("result").is_some() {
+                        tracing::info!("Bundle accepted by {}", url);
+                        return Ok(());
+                    }
+                    if let Some(e) = body.get("error") {
+                        tracing::warn!("Jito {} rejected: {}", url, e);
+                    }
+                }
+            }
+        }
+        tracing::warn!("All Jito regions failed — check Solscan");
+        Ok(())
+    }
+
+    fn base_compute_ixs(&self) -> Vec<Instruction> {
+        vec![
+            ComputeBudgetInstruction::set_compute_unit_limit(200_000),
+            ComputeBudgetInstruction::set_compute_unit_price(
+                self.config.strategy.priority_fee_micro_lamports,
+            ),
+        ]
+    }
+
+    fn jito_tip_ix(&self, payer: &Pubkey) -> Instruction {
+        let idx  = (chrono::Utc::now().timestamp() as usize) % JITO_TIP_ACCOUNTS.len();
+        // Parse and validate — if somehow still invalid, use index 0
+        let acct = JITO_TIP_ACCOUNTS.iter()
+            .cycle()
+            .skip(idx)
+            .find_map(|s| Pubkey::from_str(s).ok())
+            .expect("All Jito tip accounts are invalid — check constants");
+        system_instruction::transfer(payer, &acct, self.config.jito.tip_lamports)
+    }
+}

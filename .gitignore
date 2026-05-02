@@ -22,3 +22,4 @@ Cargo.lock   # Remove this line if you want reproducible builds (recommended for
 *.log
 logs/
 .env
+.env

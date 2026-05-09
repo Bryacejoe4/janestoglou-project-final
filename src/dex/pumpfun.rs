@@ -20,7 +20,7 @@ use solana_sdk::{
 };
 use std::str::FromStr;
 
-pub const PUMP_PROGRAM_ID:        &str = "6EF8rrecthR5DkZ8NThExdS1m596J1YAn8mSpf8NDfL8";
+pub const PUMP_PROGRAM_ID:        &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 pub const EVENT_AUTHORITY:        &str = "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7jxXpXhH";
 pub const FEE_RECIPIENT_FALLBACK: &str = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM";
 pub const LEGACY_TOKEN_PROGRAM:   &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";

@@ -93,22 +93,29 @@ impl Sniper {
                 // For a true sniper we skip the filter entirely and buy immediately.
                 // Here we apply a minimal liveness check and let the strategy filter
                 // handle further vetting (avoids waiting for volume to build).
-                let snap = TokenSnapshot {
-                    mint:              mint.clone(),
-                    volume_usd_5m:     99_999.0,   // Unknown at launch; bypass filter
-                    liquidity_sol:     min_liq as f64 / 1e9,
-                    holder_count:      1,
-                    organic_chart:     true,
-                    fresh_wallet_pct:  0.0,         // Unknown at launch
-                    sniper_bundle_pct: 0.0,
-                    top10_pct:         0.0,
-                    age_seconds:       0,
-                    price_sol:         0.000_001,   // Rough starting price
-                    ..Default::default()
-                };
-
-                // Push to strategy (non-blocking; drop if channel is full)
-                let _ = tx.try_send(StrategyEvent::NewToken(snap));
+                // Fetch real market data before signalling
+                let tx2 = tx.clone();
+                let mint2 = mint.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        use crate::market_data::MarketDataClient;
+                        let client = MarketDataClient::new(String::new());
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        let snap = client.fetch_snapshot(&mint2).await.unwrap_or_else(|_| {
+                            TokenSnapshot {
+                                mint: mint2.clone(),
+                                volume_usd_5m: 0.0,
+                                liquidity_sol: 0.0,
+                                holder_count: 0,
+                                organic_chart: true,
+                                age_seconds: 5,
+                                price_sol: 0.000_001,
+                                ..Default::default()
+                            }
+                        });
+                        let _ = tx2.try_send(StrategyEvent::NewToken(snap));
+                    });
+                }
             }
 
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())

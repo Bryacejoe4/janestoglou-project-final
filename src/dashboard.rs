@@ -57,9 +57,25 @@ impl DashboardState {
 }
 
 pub async fn run_dashboard(state: Arc<DashboardState>, interval_secs: u64) {
-    let interval = std::time::Duration::from_secs(interval_secs);
+    use crate::market_data::MarketDataClient;
+    let client = MarketDataClient::new(String::new());
+
+    // Fetch SOL/USD immediately on start
+    if let Ok(price) = client.fetch_sol_price_usd().await {
+        state.update_sol_usd(price);
+    }
+
+    let interval     = std::time::Duration::from_secs(interval_secs);
+    let mut tick     = 0u32;
     loop {
         tokio::time::sleep(interval).await;
+        // Refresh SOL/USD every 4 ticks (every 60s if interval=15)
+        tick += 1;
+        if tick % 4 == 0 {
+            if let Ok(price) = client.fetch_sol_price_usd().await {
+                state.update_sol_usd(price);
+            }
+        }
         print_dashboard(&state);
     }
 }

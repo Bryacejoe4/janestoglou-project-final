@@ -1,4 +1,4 @@
-// src/main.rs — Phase 2 complete
+// src/main.rs 
 pub mod config;
 pub mod wallet;
 pub mod utils;

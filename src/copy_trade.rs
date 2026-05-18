@@ -1,15 +1,18 @@
 // src/copy_trade.rs 
-// Mirrors BOTH buy and sell signals from watched wallets.
+// Same WSS fix as sniper.rs — blocking pubsub had silent message delivery failure
 
 use anyhow::Result;
+use futures_util::StreamExt;
+use solana_client::{
+    nonblocking::pubsub_client::PubsubClient,
+    rpc_config::{RpcTransactionLogsConfig, RpcTransactionLogsFilter},
+};
+use solana_sdk::commitment_config::CommitmentConfig;
 use tokio::sync::mpsc;
 
 use crate::{
     config::BotConfig,
-    strategy::{
-        filters::TokenSnapshot,
-        gembot::StrategyEvent,
-    },
+    strategy::{filters::TokenSnapshot, gembot::StrategyEvent},
 };
 
 pub struct CopyTrader {
@@ -24,7 +27,7 @@ impl CopyTrader {
 
     pub async fn run(self) -> Result<()> {
         if !self.config.copy_trade.enabled {
-            tracing::info!("Copy trading disabled (set copy_trade.enabled = true in config)");
+            tracing::info!("Copy trading disabled");
             return Ok(());
         }
         let watched = self.config.copy_trade.watched_wallets.clone();
@@ -35,91 +38,70 @@ impl CopyTrader {
 
         tracing::info!("Copy trader monitoring {} wallet(s)", watched.len());
 
-        let wss_url  = self.config.wss_url.clone();
-        let tx       = self.tx.clone();
-        let size_pct = self.config.copy_trade.trade_size_pct;
-
-        for wallet_str in watched {
-            let wss = wss_url.clone();
-            let tx2 = tx.clone();
-            let addr = wallet_str.clone();
-            tokio::task::spawn_blocking(move || {
-                watch_wallet_blocking(&wss, &addr, tx2, size_pct)
+        for wallet in watched {
+            let wss_url = self.config.wss_url.clone();
+            let tx2     = self.tx.clone();
+            let w       = wallet.clone();
+            tokio::spawn(async move {
+                loop {
+                    match watch_wallet_async(&wss_url, &w, tx2.clone()).await {
+                        Ok(_)  => tracing::warn!("Copy trade {}… subscription ended — reconnecting…", &w[..8.min(w.len())]),
+                        Err(e) => tracing::error!("Copy trade {}… error: {} — reconnecting in 3s…", &w[..8.min(w.len())], e),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
             });
         }
 
+        // Keep alive
         futures_util::future::pending::<()>().await;
         Ok(())
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Blocking wallet watcher — mirrors both buys AND sells
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn watch_wallet_blocking(
-    wss_url:  &str,
-    wallet:   &str,
-    tx:       mpsc::Sender<StrategyEvent>,
-    _size_pct: f64,
-) {
-    use solana_client::pubsub_client::PubsubClient;
-    use solana_client::rpc_config::{
-        RpcTransactionLogsConfig, RpcTransactionLogsFilter,
-    };
-    use solana_sdk::commitment_config::CommitmentConfig;
+async fn watch_wallet_async(
+    wss_url: &str,
+    wallet:  &str,
+    tx:      mpsc::Sender<StrategyEvent>,
+) -> Result<()> {
+    let pubsub = PubsubClient::new(wss_url).await
+        .map_err(|e| anyhow::anyhow!("PubsubClient::new: {}", e))?;
 
     let filter = RpcTransactionLogsFilter::Mentions(vec![wallet.to_string()]);
     let config = RpcTransactionLogsConfig {
         commitment: Some(CommitmentConfig::confirmed()),
     };
 
-    let (_sub, receiver) = match PubsubClient::logs_subscribe(wss_url, filter, config) {
-        Ok(s)  => s,
-        Err(e) => {
-            tracing::error!("Copy trade subscribe for {}: {}", wallet, e);
-            return;
-        }
-    };
+    let (mut stream, _unsub) = pubsub.logs_subscribe(filter, config).await
+        .map_err(|e| anyhow::anyhow!("logs_subscribe for {}…: {}", &wallet[..8.min(wallet.len())], e))?;
 
-    tracing::info!("Copy trade: watching {}…", &wallet[..8.min(wallet.len())]);
+    tracing::info!("Copy trade watching {}… ✓", &wallet[..8.min(wallet.len())]);
 
-    loop {
-        let response = match receiver.recv() {
-            Ok(r)  => r,
-            Err(_) => {
-                tracing::warn!("Copy trade: lost connection to {}…", &wallet[..8.min(wallet.len())]);
-                break;
-            }
-        };
-
+    while let Some(response) = stream.next().await {
         let logs: Vec<String> = response.value.logs;
 
-        let is_pump_buy  = logs.iter().any(|l: &String| l.contains("Instruction: Buy"));
-        let is_pump_sell = logs.iter().any(|l: &String| l.contains("Instruction: Sell"));
+        let is_buy  = logs.iter().any(|l: &String| l.contains("Instruction: Buy") || l.contains("Instruction: BuyExactSolIn"));
+        let is_sell = logs.iter().any(|l: &String| l.contains("Instruction: Sell"));
 
-        if !is_pump_buy && !is_pump_sell { continue; }
+        if !is_buy && !is_sell { continue; }
 
-        let mint = match extract_mint_from_logs(&logs) {
+        let mint = match extract_mint(&logs) {
             Some(m) => m,
             None    => continue,
         };
 
-        tracing::info!(
-            "📋 COPY {} from {}… on {}…",
-            if is_pump_buy { "BUY" } else { "SELL" },
+        tracing::info!("📋 COPY {} from {}… on {}…",
+            if is_buy { "BUY" } else { "SELL" },
             &wallet[..8.min(wallet.len())],
-            &mint[..8.min(mint.len())]
-        );
+            &mint[..8.min(mint.len())]);
 
-        if is_pump_buy {
-            // Mirror the buy — let strategy filters decide if it's good
+        if is_buy {
             let snap = TokenSnapshot {
-                mint: mint.clone(),
-                volume_usd_5m: 99_999.0,  // bypass volume filter for copy trades
-                liquidity_sol: 10.0,
-                holder_count:  100,
-                organic_chart: true,
+                mint:              mint.clone(),
+                volume_usd_5m:     99_999.0,
+                liquidity_sol:     10.0,
+                holder_count:      100,
+                organic_chart:     true,
                 fresh_wallet_pct:  0.0,
                 sniper_bundle_pct: 0.0,
                 top10_pct:         0.0,
@@ -128,20 +110,21 @@ fn watch_wallet_blocking(
                 ..Default::default()
             };
             let _ = tx.try_send(StrategyEvent::NewToken(snap));
-        } else if is_pump_sell {
-            // Mirror the sell — emit CopySell so strategy exits the position
-            let _ = tx.try_send(StrategyEvent::CopySell { mint: mint.clone() });
+        }
+
+        if is_sell {
+            let _ = tx.try_send(StrategyEvent::CopySell { mint });
         }
     }
+
+    Ok(())
 }
 
-fn extract_mint_from_logs(logs: &[String]) -> Option<String> {
+fn extract_mint(logs: &[String]) -> Option<String> {
     for line in logs {
         if let Some(pos) = line.find("mint: ") {
             let after = &line[pos + 6..];
-            let mint: String = after.chars()
-                .take_while(|c| c.is_alphanumeric())
-                .collect();
+            let mint: String = after.chars().take_while(|c| c.is_alphanumeric()).collect();
             if mint.len() >= 32 { return Some(mint); }
         }
     }

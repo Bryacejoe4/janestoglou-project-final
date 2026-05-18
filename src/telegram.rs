@@ -1,15 +1,6 @@
 // src/telegram.rs
 // Sends real-time trade alerts to a Telegram bot.
-//
-// Setup (one-time, takes 2 minutes):
-//   1. Message @BotFather on Telegram → /newbot → copy the token
-//   2. Message your new bot once (any text)
-//   3. Visit: https://api.telegram.org/bot<TOKEN>/getUpdates
-//      Copy the "id" field from "chat" — that is your CHAT_ID
-//   4. Add to .env:
-//        TELEGRAM_BOT_TOKEN=123456:ABC-your-token
-//        TELEGRAM_CHAT_ID=987654321
-//
+
 // If TELEGRAM_BOT_TOKEN is not set, all calls are silent no-ops.
 
 use reqwest::Client;

@@ -43,6 +43,8 @@ pub struct RiskConfig {
     pub max_position_pct:      f64,
     pub daily_loss_limit_pct:  f64,
     pub max_sol_per_trade:     u64,
+    pub max_open_positions: usize,
+    pub buy_cooldown_secs:  u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -91,6 +93,8 @@ struct TomlRisk {
     max_position_pct:     Option<f64>,
     daily_loss_limit_pct: Option<f64>,
     max_sol_per_trade:    Option<u64>,
+    max_open_positions:   Option<usize>,
+    buy_cooldown_secs:    Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -189,6 +193,8 @@ impl BotConfig {
                 max_position_pct:     tr.max_position_pct.unwrap_or(0.15),
                 daily_loss_limit_pct: tr.daily_loss_limit_pct.unwrap_or(0.10),
                 max_sol_per_trade:    max_sol,
+                max_open_positions:   10,
+                buy_cooldown_secs:    5,
             },
             sniper: SniperConfig {
                 enabled:                tsn.enabled.unwrap_or(true),

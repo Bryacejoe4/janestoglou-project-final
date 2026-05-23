@@ -32,23 +32,41 @@ impl RiskManager {
 
     /// Returns the lamport amount we are allowed to spend on the next trade.
     /// Returns Err if trading is paused for any reason.
-    pub fn allowed_trade_size(&self, current_balance_lamports: u64) -> Result<u64> {
+    pub fn allowed_trade_size(
+        &self,
+        current_balance_lamports: u64,
+        open_position_count: usize,
+        last_buy_timestamp:  std::time::Instant,
+    ) -> Result<u64> {
         if self.paused {
             return Err(anyhow!("Bot paused: daily loss limit was breached"));
         }
         if self.state.limit_breached(self.cfg.daily_loss_limit_pct) {
-            return Err(anyhow!(
-                "Daily loss limit reached ({:.1}% of starting balance)",
-                self.cfg.daily_loss_limit_pct * 100.0
-            ));
+            return Err(anyhow!("Daily loss limit reached"));
         }
 
-        let position_cap = (current_balance_lamports as f64 * self.cfg.max_position_pct) as u64;
-        let hard_cap     = self.cfg.max_sol_per_trade;
-        let allowed      = position_cap.min(hard_cap);
+        // SOL floor — never trade below 0.05 SOL reserve
+        let floor_lamports = 50_000_000u64;
+        if current_balance_lamports <= floor_lamports {
+            return Err(anyhow!("Balance below SOL floor reserve (0.05 SOL)"));
+        }
+
+        // Concurrent position cap
+        if open_position_count >= self.cfg.max_open_positions {
+            return Err(anyhow!("Max concurrent positions reached ({})", self.cfg.max_open_positions));
+        }
+
+        // Buy cooldown
+        if last_buy_timestamp.elapsed() < std::time::Duration::from_secs(self.cfg.buy_cooldown_secs) {
+            return Err(anyhow!("Buy cooldown active, wait {}s between buys", self.cfg.buy_cooldown_secs));
+        }
+
+        let tradeable_balance = current_balance_lamports.saturating_sub(floor_lamports);
+        let position_cap = (tradeable_balance as f64 * self.cfg.max_position_pct) as u64;
+        let allowed = position_cap.min(self.cfg.max_sol_per_trade);
 
         if allowed == 0 {
-            return Err(anyhow!("Calculated trade size is 0 – balance too low"));
+            return Err(anyhow!("Calculated trade size is 0"));
         }
 
         Ok(allowed)

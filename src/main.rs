@@ -275,8 +275,11 @@ fn run_offline_tests() {
 
     let mut rm = RiskManager::new(RiskConfig {
         max_position_pct: 0.15, daily_loss_limit_pct: 0.10, max_sol_per_trade: 500_000_000,
+        max_open_positions: 5, buy_cooldown_secs: 5,
     }, 2_000_000_000);
-    let _ = rm.allowed_trade_size(2_000_000_000).unwrap();
+    let _ = rm.allowed_trade_size(2_000_000_000, 0, std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(9999))
+        .unwrap_or_else(std::time::Instant::now)).unwrap();
     rm.record_trade(-250_000_000);
     assert!(rm.is_paused());
     println!("✅ [6/7] Risk manager pauses on loss");

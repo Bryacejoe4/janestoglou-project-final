@@ -109,7 +109,9 @@ impl TradingEngine {
             &payer, mint, token_amount, max_sol_cost, tok,
             &fee, &bc_info.creator, &bc_ata, &user_ata,
         ));
-        ixs.push(self.jito_tip_ix(&payer));
+        if self.config.jito.enabled {
+            ixs.push(self.jito_tip_ix(&payer));
+        }
         self.simulate_and_send(keypair, &ixs).await
     }
 
@@ -140,7 +142,9 @@ impl TradingEngine {
             &fee, &bc_info.creator, &bc_ata, &user_ata,
             bc_info.cashback_enabled,
         ));
-        ixs.push(self.jito_tip_ix(&payer));
+        if self.config.jito.enabled {
+            ixs.push(self.jito_tip_ix(&payer));
+        }
         self.simulate_and_send(keypair, &ixs).await
     }
 
@@ -171,7 +175,9 @@ impl TradingEngine {
             ));
         }
         ixs.push(raydium::build_swap_instruction(&pool, &payer, &src, &dst, amount_in, min_amount_out));
-        ixs.push(self.jito_tip_ix(&payer));
+        if self.config.jito.enabled {
+            ixs.push(self.jito_tip_ix(&payer));
+        }
         self.simulate_and_send(keypair, &ixs).await
     }
 

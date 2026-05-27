@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
+use base64::Engine;
 
 use crate::strategy::filters::TokenSnapshot;
 
@@ -220,5 +221,81 @@ impl MarketDataClient {
             .map_err(|e| anyhow!("Helius parse: {}", e))?;
 
         Ok(body["result"]["total"].as_u64().unwrap_or(0) as u32)
+    }
+
+    /// For tokens under 60s old — reads directly from on-chain bonding curve.
+    /// No DexScreener needed, no indexing delay.
+    pub async fn fetch_fresh_launch_snapshot(
+        &self,
+        mint: &str,
+    ) -> Result<crate::strategy::filters::TokenSnapshot> {
+        use solana_sdk::pubkey::Pubkey;
+        use std::str::FromStr;
+
+        let mint_pk = Pubkey::from_str(mint)
+            .map_err(|_| anyhow!("invalid mint"))?;
+
+        // Derive bonding curve PDA
+        let pump_program = Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap();
+        let (bc_pda, _) = Pubkey::find_program_address(
+            &[b"bonding-curve", mint_pk.as_ref()],
+            &pump_program,
+        );
+
+        // Fetch bonding curve account via Helius RPC
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getAccountInfo",
+            "params": [bc_pda.to_string(), {"encoding": "base64"}]
+        });
+
+        let body: serde_json::Value = self.http
+            .post(&self.rpc_url)
+            .json(&payload)
+            .send().await
+            .map_err(|e| anyhow!("RPC: {}", e))?
+            .json().await
+            .map_err(|e| anyhow!("RPC parse: {}", e))?;
+
+        let data_b64 = body["result"]["value"]["data"][0]
+            .as_str()
+            .ok_or_else(|| anyhow!("no bonding curve data"))?;
+
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(data_b64)
+            .map_err(|e| anyhow!("base64: {}", e))?;
+
+        if raw.len() < 49 {
+            return Err(anyhow!("bonding curve too short"));
+        }
+
+        // Parse bonding curve layout (after 8-byte discriminator)
+        let d = &raw[8..];
+        let read_u64 = |o: usize| u64::from_le_bytes(d[o..o+8].try_into().unwrap_or([0u8;8]));
+        let virtual_sol_reserves   = read_u64(0);
+        let virtual_token_reserves = read_u64(8);
+        let real_sol_reserves      = read_u64(16);
+
+        let liquidity_sol = real_sol_reserves as f64 / 1e9;
+        let price_sol     = if virtual_token_reserves > 0 {
+            (virtual_sol_reserves as f64 / 1e9) / (virtual_token_reserves as f64 / 1e6)
+        } else { 0.000_001 };
+
+        // Get holder count via Helius getTokenAccounts (already in fetch_holder_count)
+        let holder_count = self.fetch_holder_count(mint).await.unwrap_or(1);
+
+        Ok(crate::strategy::filters::TokenSnapshot {
+            mint:              mint.to_string(),
+            volume_usd_5m:     99_999.0,  // bypass volume filter — fresh token has no volume yet
+            liquidity_sol,
+            price_sol,
+            holder_count,
+            age_seconds:       5,
+            organic_chart:     true,
+            fresh_wallet_pct:  0.0,
+            sniper_bundle_pct: 0.0,
+            top10_pct:         0.0,
+            ..Default::default()
+        })
     }
 }

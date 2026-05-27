@@ -75,7 +75,7 @@ impl RiskManager {
     // ─────────────────────────────────────────────────────────────────────────
     //  Post-trade accounting
     // ─────────────────────────────────────────────────────────────────────────
-
+    /*
     pub fn record_trade(&mut self, pnl_lamports: i64) {
         self.state.realised_pnl_lamports += pnl_lamports;
         self.state.trade_count           += 1;
@@ -85,6 +85,23 @@ impl RiskManager {
                 "⚠️  Daily loss limit hit ({:.1}%)! Bot is now PAUSED.",
                 self.state.loss_fraction() * 100.0
             );
+            self.paused = true;
+        }
+    }
+    */
+    pub fn record_buy(&mut self, lamports_spent: u64) {
+        self.state.unrealized_spend_lamports =
+            self.state.unrealized_spend_lamports.saturating_add(lamports_spent);
+    }
+
+    pub fn record_sell(&mut self, pnl_lamports: i64, lamports_spent: u64) {
+        self.state.realised_pnl_lamports += pnl_lamports;
+        self.state.trade_count += 1;
+        self.state.unrealized_spend_lamports =
+            self.state.unrealized_spend_lamports.saturating_sub(lamports_spent);
+
+        if self.state.limit_breached(self.cfg.daily_loss_limit_pct) {
+            tracing::warn!("⚠️ Daily loss limit hit! Bot is now PAUSED.");
             self.paused = true;
         }
     }

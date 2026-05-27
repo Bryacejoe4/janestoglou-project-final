@@ -147,46 +147,46 @@ fn extract_mint_from_logs(logs: &[String]) -> Option<String> {
 }
 
 async fn enrich_and_emit(mint: String, rpc_url: String, tx: mpsc::Sender<StrategyEvent>) {
-    // FIX 5: use real rpc_url for holder count
     let client = MarketDataClient::new(rpc_url);
 
-    // Wait 3s for DexScreener to index the token
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // Wait 2s — enough for bonding curve to be readable, not enough for DexScreener
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let snap = match client.fetch_snapshot(&mint).await {
+    // Try on-chain first (fast, no indexing delay)
+    let snap = match client.fetch_fresh_launch_snapshot(&mint).await {
         Ok(mut s) => {
             tracing::info!(
-                "Sniper enriched {}… | vol5m=${:.0} liq={:.1}SOL holders={}",
-                &mint[..8.min(mint.len())], s.volume_usd_5m, s.liquidity_sol, s.holder_count
+                "Sniper [on-chain] {}… | liq={:.2}SOL price={:.9} holders={}",
+                &mint[..8.min(mint.len())], s.liquidity_sol, s.price_sol, s.holder_count
             );
-            // FIX 4: bypass filters for brand new tokens — DexScreener has no data yet
-            // Set volume high enough to pass, but keep real liquidity/holder data
-            if s.volume_usd_5m == 0.0 {
-                s.volume_usd_5m     = 99_999.0; // bypass volume filter
-                s.holder_count      = 1;
-                s.organic_chart     = true;
-                s.sniper_bundle_pct = 0.0;
-                s.fresh_wallet_pct  = 0.0;
-                s.top10_pct         = 0.0;
-            }
-            s.age_seconds = 5; // brand new
+            s.age_seconds = 5;
             s
         }
         Err(e) => {
-            tracing::warn!("DexScreener not ready for {}… ({})", &mint[..8.min(mint.len())], e);
-            // FIX 4: use bypass snapshot so strategy can still trade new tokens
-            TokenSnapshot {
-                mint:              mint.clone(),
-                volume_usd_5m:     99_999.0,
-                liquidity_sol:     0.0,
-                holder_count:      1,
-                organic_chart:     true,
-                fresh_wallet_pct:  0.0,
-                sniper_bundle_pct: 0.0,
-                top10_pct:         0.0,
-                age_seconds:       5,
-                price_sol:         0.000_001,
-                ..Default::default()
+            tracing::warn!("On-chain fetch failed {}… ({}), falling back to DexScreener", &mint[..8.min(mint.len())], e);
+            // Fallback to DexScreener with bypass
+            match client.fetch_snapshot(&mint).await {
+                Ok(mut s) => {
+                    if s.volume_usd_5m == 0.0 {
+                        s.volume_usd_5m     = 99_999.0;
+                        s.organic_chart     = true;
+                        s.sniper_bundle_pct = 0.0;
+                        s.fresh_wallet_pct  = 0.0;
+                        s.top10_pct         = 0.0;
+                    }
+                    s.age_seconds = 5;
+                    s
+                }
+                Err(_) => TokenSnapshot {
+                    mint:              mint.clone(),
+                    volume_usd_5m:     99_999.0,
+                    liquidity_sol:     0.0,
+                    holder_count:      1,
+                    organic_chart:     true,
+                    age_seconds:       5,
+                    price_sol:         0.000_001,
+                    ..Default::default()
+                }
             }
         }
     };

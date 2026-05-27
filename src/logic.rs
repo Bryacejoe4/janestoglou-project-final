@@ -208,13 +208,16 @@ pub struct DailyRiskState {
     pub starting_balance_lamports: u64,
     pub realised_pnl_lamports:     i64,
     pub trade_count:               u32,
+    pub unrealized_spend_lamports: u64,
 }
 
 impl DailyRiskState {
     pub fn loss_fraction(&self) -> f64 {
         if self.starting_balance_lamports == 0 { return 0.0; }
-        let loss = self.realised_pnl_lamports.min(0).unsigned_abs();
-        loss as f64 / self.starting_balance_lamports as f64
+        // Count both realized losses AND unrealized open exposure
+        let realized_loss = self.realised_pnl_lamports.min(0).unsigned_abs();
+        let total_loss = realized_loss + self.unrealized_spend_lamports / 2; // weight unrealized at 50%
+        total_loss as f64 / self.starting_balance_lamports as f64
     }
 
     pub fn limit_breached(&self, limit_pct: f64) -> bool {

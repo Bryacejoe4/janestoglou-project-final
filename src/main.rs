@@ -280,7 +280,7 @@ fn run_offline_tests() {
     let _ = rm.allowed_trade_size(2_000_000_000, 0, std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(9999))
         .unwrap_or_else(std::time::Instant::now)).unwrap();
-    rm.record_buy(250_000_000);
+    rm.record_sell(-250_000_000, 250_000_000);
     assert!(rm.is_paused());
     println!("✅ [6/7] Risk manager pauses on loss");
 

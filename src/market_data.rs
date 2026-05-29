@@ -97,7 +97,7 @@ impl MarketDataClient {
         }
 
         // Fallback: DexScreener WSOL pairs
-        tracing::debug!("Binance failed, trying DexScreener for SOL/USD…");
+        //tracing::debug!("Binance failed, trying DexScreener for SOL/USD…");
         self.fetch_sol_usd_dexscreener().await
     }
 
@@ -199,94 +199,81 @@ impl MarketDataClient {
     }
 
     async fn fetch_holder_count(&self, mint: &str) -> Result<u32> {
-        // Skip holder count if rpc_url is empty (dashboard SOL price fetch)
         if self.rpc_url.is_empty() { return Ok(0); }
-
         let payload = serde_json::json!({
             "jsonrpc": "2.0", "id": 1,
             "method": "getTokenAccounts",
-            "params": {
-                "mint": mint,
-                "limit": 1000,
-                "options": { "showZeroBalance": false }
-            }
+            "params": { "mint": mint, "limit": 1000, "options": { "showZeroBalance": false } }
         });
-
         let body: serde_json::Value = self.http
-            .post(&self.rpc_url)
-            .json(&payload)
-            .send().await
+            .post(&self.rpc_url).json(&payload).send().await
             .map_err(|e| anyhow!("Helius: {}", e))?
             .json().await
             .map_err(|e| anyhow!("Helius parse: {}", e))?;
-
         Ok(body["result"]["total"].as_u64().unwrap_or(0) as u32)
     }
 
-    /// For tokens under 60s old — reads directly from on-chain bonding curve.
-    /// No DexScreener needed, no indexing delay.
-    pub async fn fetch_fresh_launch_snapshot(
-        &self,
-        mint: &str,
-    ) -> Result<crate::strategy::filters::TokenSnapshot> {
+    /// Fresh launch snapshot — reads bonding curve on-chain via RPC.
+    /// Tries both seed variants, falls back to Pump.fun genesis constants if not yet on-chain.
+    pub async fn fetch_fresh_launch_snapshot(&self, mint: &str) -> Result<TokenSnapshot> {
         use solana_sdk::pubkey::Pubkey;
         use std::str::FromStr;
 
-        let mint_pk = Pubkey::from_str(mint)
-            .map_err(|_| anyhow!("invalid mint"))?;
-
-        // Derive bonding curve PDA
-        let pump_program = Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap();
-        let (bc_pda, _) = Pubkey::find_program_address(
-            &[b"bonding-curve", mint_pk.as_ref()],
-            &pump_program,
-        );
-
-        // Fetch bonding curve account via Helius RPC
-        let payload = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getAccountInfo",
-            "params": [bc_pda.to_string(), {"encoding": "base64"}]
-        });
-
-        let body: serde_json::Value = self.http
-            .post(&self.rpc_url)
-            .json(&payload)
-            .send().await
-            .map_err(|e| anyhow!("RPC: {}", e))?
-            .json().await
-            .map_err(|e| anyhow!("RPC parse: {}", e))?;
-
-        let data_b64 = body["result"]["value"]["data"][0]
-            .as_str()
-            .ok_or_else(|| anyhow!("no bonding curve data"))?;
-
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(data_b64)
-            .map_err(|e| anyhow!("base64: {}", e))?;
-
-        if raw.len() < 49 {
-            return Err(anyhow!("bonding curve too short"));
+        if self.rpc_url.is_empty() {
+            return Err(anyhow!("no rpc_url"));
         }
 
-        // Parse bonding curve layout (after 8-byte discriminator)
-        let d = &raw[8..];
-        let read_u64 = |o: usize| u64::from_le_bytes(d[o..o+8].try_into().unwrap_or([0u8;8]));
-        let virtual_sol_reserves   = read_u64(0);
-        let virtual_token_reserves = read_u64(8);
-        let real_sol_reserves      = read_u64(16);
+        let mint_pk      = Pubkey::from_str(mint).map_err(|_| anyhow!("invalid mint"))?;
+        let pump_program = Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap();
 
-        let liquidity_sol = real_sol_reserves as f64 / 1e9;
-        let price_sol     = if virtual_token_reserves > 0 {
-            (virtual_sol_reserves as f64 / 1e9) / (virtual_token_reserves as f64 / 1e6)
-        } else { 0.000_001 };
+        // Try both seeds — older tokens use "bonding-curve", newer CreateV2 tokens use "bonding-curve-v2"
+        let mut parsed: Option<(f64, f64)> = None;
+        for seed in [b"bonding-curve" as &[u8], b"bonding-curve-v2"] {
+            let (bc_pda, _) = Pubkey::find_program_address(&[seed, mint_pk.as_ref()], &pump_program);
+            let payload = serde_json::json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getAccountInfo",
+                "params": [bc_pda.to_string(), {"encoding": "base64"}]
+            });
+            if let Ok(resp) = self.http.post(&self.rpc_url).json(&payload).send().await {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if let Some(b64) = body["result"]["value"]["data"][0].as_str() {
+                        if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                            if raw.len() >= 49 {
+                                let d = &raw[8..];
+                                let ru = |o: usize| -> u64 {
+                                    u64::from_le_bytes(d[o..o+8].try_into().unwrap_or([0u8;8]))
+                                };
+                                let vsr = ru(0);
+                                let vtr = ru(8);
+                                let rsr = ru(16);
+                                let liq   = rsr as f64 / 1e9;
+                                let price = if vtr > 0 {
+                                    (vsr as f64 / 1e9) / (vtr as f64 / 1e6)
+                                } else { 0.000_001 };
+                                parsed = Some((liq, price));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
-        // Get holder count via Helius getTokenAccounts (already in fetch_holder_count)
+        // If bonding curve not yet on-chain, use Pump.fun genesis constants (identical for every new token)
+        let (liquidity_sol, price_sol) = parsed.unwrap_or_else(|| {
+            let vsr: u64 = 30_000_000_000;
+            let vtr: u64 = 1_073_000_000_000_000;
+            let price = (vsr as f64 / 1e9) / (vtr as f64 / 1e6);
+            tracing::debug!("Sniper: BC not yet on-chain for {}…, using genesis defaults", &mint[..8.min(mint.len())]);
+            (0.0, price)
+        });
+
         let holder_count = self.fetch_holder_count(mint).await.unwrap_or(1);
 
-        Ok(crate::strategy::filters::TokenSnapshot {
+        Ok(TokenSnapshot {
             mint:              mint.to_string(),
-            volume_usd_5m:     99_999.0,  // bypass volume filter — fresh token has no volume yet
+            volume_usd_5m:     99_999.0,
             liquidity_sol,
             price_sol,
             holder_count,

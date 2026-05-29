@@ -6,6 +6,7 @@ use anyhow::Result;
 use solana_sdk::{pubkey::Pubkey, signature::Signer};
 use std::str::FromStr;
 use std::sync::Arc;
+use crate::strategy::risk::RiskManager;
 
 use crate::{
     config::{BotConfig, StrategyConfig},
@@ -41,7 +42,8 @@ pub struct GembotStrategy {
     wallet_index: usize,
     dashboard:    Arc<DashboardState>,
     telegram:     TelegramBot,
-    last_buy:     std::time::Instant,  // ← NEW: cooldown tracking
+    last_buy:     std::time::Instant,  // cooldown tracking
+    risk: RiskManager,
 }
 
 impl GembotStrategy {
@@ -75,6 +77,7 @@ impl GembotStrategy {
             dashboard,
             telegram: TelegramBot::from_env(),
             last_buy,
+            risk: RiskManager::new(bot_cfg.risk.clone(), 0),
         }
     }
 
@@ -85,6 +88,8 @@ impl GembotStrategy {
 
         let start_bal = self.engine.sol_balance(&self.wallets.main().pubkey())
             .await.unwrap_or(0);
+        self.risk = RiskManager::new(self.engine.config.risk.clone(), start_bal);
+
         let start_sol = utils::lamports_to_sol(start_bal);
         self.dashboard.update_balance(start_sol);
         *self.dashboard.start_balance.write() = start_sol;
@@ -183,6 +188,7 @@ impl GembotStrategy {
         match self.engine.pump_buy(keypair, &mint_pk, tokens_estimate, max_cost).await {
             Ok(sig) => {
                 tracing::info!("BUY ✓ {}", sig);
+                self.risk.record_buy(trade_sol);
 
                 // Update cooldown timestamp immediately after successful buy
                 self.last_buy = std::time::Instant::now();
@@ -373,6 +379,8 @@ impl GembotStrategy {
         match sig_result {
             Ok(sig) => {
                 tracing::info!("SELL ✓ {} | PnL: {:+.4} SOL", sig, pnl_sol);
+                let pnl_lamports = (pnl_sol * 1e9) as i64;
+                self.risk.record_sell(pnl_lamports, 0);
 
                 let sol_usd = *self.dashboard.sol_usd.read();
                 self.telegram.alert_sell(mint_str, pnl_sol, sol_usd, reason, &sig).await;

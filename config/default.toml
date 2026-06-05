@@ -1,0 +1,35 @@
+[strategy]
+entry_split              = true
+second_entry_dip_pct     = 0.25
+max_entries_per_token    = 2
+take_profit_pct          = 0.25
+stop_loss_pct            = 0.12
+moonbag_pct              = 0.10
+trailing_stop_pct        = 0.08
+slippage_bps             = 200
+priority_fee_micro_lamports = 100000
+max_retries              = 3
+
+[risk]
+max_position_pct         = 0.15
+daily_loss_limit_pct     = 0.10
+max_sol_per_trade        = 500000000
+max_open_positions       = 10
+buy_cooldown_secs        = 5
+
+[sniper]
+enabled                  = true
+min_liquidity_lamports   = 0
+min_volume_usd           = 0.0
+max_fresh_wallet_pct     = 0.60
+max_sniper_bundle_pct    = 0.40
+buy_amount_lamports      = 100000000
+
+[copy_trade]
+enabled                  = false
+watched_wallets          = []
+trade_size_pct           = 0.50
+
+[jito]
+enabled                  = true
+tip_lamports             = 15000000

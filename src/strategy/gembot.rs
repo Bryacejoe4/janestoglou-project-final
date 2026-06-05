@@ -55,13 +55,13 @@ impl GembotStrategy {
     ) -> Self {
         let sc     = &bot_cfg.sniper;
         let filter = TokenFilter::new(FilterConfig {
-            min_volume_usd_5m:     sc.min_volume_usd,
-            min_liquidity_sol:     sc.min_liquidity_lamports as f64 / 1e9,
+            min_volume_usd_5m:     0.0,
+            min_liquidity_sol:     1.0,
             max_fresh_wallet_pct:  sc.max_fresh_wallet_pct,
             max_sniper_bundle_pct: sc.max_sniper_bundle_pct,
-            max_top10_pct:         0.40,
-            min_holder_count:      50,
-            min_age_seconds:       30,
+            max_top10_pct:         0.70,
+            min_holder_count:      1,
+            min_age_seconds:       1,
         });
         // Initialise last_buy far in the past so first trade is never blocked
         let last_buy = std::time::Instant::now()

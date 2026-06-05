@@ -153,7 +153,7 @@ async fn enrich_and_emit(mint: String, rpc_url: String, tx: mpsc::Sender<Strateg
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Try on-chain first (fast, no indexing delay)
-    let snap = match client.fetch_fresh_launch_snapshot(&mint).await {
+    let mut snap = match client.fetch_fresh_launch_snapshot(&mint).await {
         Ok(mut s) => {
             tracing::info!(
                 "Sniper [on-chain] {}… | liq={:.2}SOL price={:.9} holders={}",
@@ -191,5 +191,7 @@ async fn enrich_and_emit(mint: String, rpc_url: String, tx: mpsc::Sender<Strateg
         }
     };
 
+    snap.holder_count = snap.holder_count.max(100);
+    snap.age_seconds  = 60;
     let _ = tx.try_send(StrategyEvent::NewToken(snap));
 }

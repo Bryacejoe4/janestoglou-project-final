@@ -266,10 +266,26 @@ impl MarketDataClient {
             let vtr: u64 = 1_073_000_000_000_000;
             let price = (vsr as f64 / 1e9) / (vtr as f64 / 1e6);
             tracing::debug!("Sniper: BC not yet on-chain for {}…, using genesis defaults", &mint[..8.min(mint.len())]);
-            (0.0, price)
+            (vsr as f64 / 1e9, price)
         });
 
-        let holder_count = self.fetch_holder_count(mint).await.unwrap_or(1);
+        //let holder_count = self.fetch_holder_count(mint).await.unwrap_or(1);
+
+        let (quality, holder_count) = tokio::join!(
+            self.fetch_launch_quality(mint),
+            self.fetch_holder_count(mint),
+        );
+        let (sniper_bundle_pct, fresh_wallet_pct, top10_pct) = quality;
+        let holder_count = holder_count.unwrap_or(1);
+
+        tracing::info!(
+            "Quality {}… sniper={:.0}% fresh={:.0}% top10={:.0}% holders={}",
+            &mint[..8.min(mint.len())],
+            sniper_bundle_pct * 100.0,
+            fresh_wallet_pct  * 100.0,
+            top10_pct         * 100.0,
+            holder_count,
+        );
 
         Ok(TokenSnapshot {
             mint:              mint.to_string(),
@@ -279,10 +295,130 @@ impl MarketDataClient {
             holder_count,
             age_seconds:       5,
             organic_chart:     true,
-            fresh_wallet_pct:  0.0,
-            sniper_bundle_pct: 0.0,
-            top10_pct:         0.0,
+            fresh_wallet_pct,
+            sniper_bundle_pct,
+            top10_pct,
             ..Default::default()
         })
+    }
+
+    /// Score a fresh launch using on-chain data only.
+    /// Populates: sniper_bundle_pct, fresh_wallet_pct, top10_pct
+    /// All via Helius RPC — no third-party APIs needed.
+    pub async fn fetch_launch_quality(&self, mint: &str) -> (f64, f64, f64) {
+        // Returns (sniper_bundle_pct, fresh_wallet_pct, top10_pct)
+        // Defaults to (0, 0, 0) — passes all filters — if any step fails.
+        // This means a data failure never blocks a trade, it just skips quality gating.
+        let (top10, _) = self.fetch_top10_concentration(mint).await;
+        let (sniper_pct, fresh_pct) = self.fetch_bundle_and_fresh(mint).await;
+        (sniper_pct, fresh_pct, top10)
+    }
+
+    async fn fetch_top10_concentration(&self, mint: &str) -> (f64, u64) {
+        if self.rpc_url.is_empty() { return (0.0, 0); }
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getTokenAccounts",
+            "params": {
+                "mint": mint,
+                "limit": 1000,
+                "options": { "showZeroBalance": false }
+            }
+        });
+
+        let Ok(resp) = self.http.post(&self.rpc_url).json(&payload).send().await else { return (0.0, 0); };
+        let Ok(body) = resp.json::<serde_json::Value>().await else { return (0.0, 0); };
+        let accounts = match body["result"]["token_accounts"].as_array() {
+            Some(a) => a.clone(),
+            None    => return (0.0, 0),
+        };
+
+        let mut balances: Vec<u64> = accounts.iter()
+            .filter_map(|a| a["amount"].as_str()?.parse::<u64>().ok())
+            .collect();
+
+        if balances.is_empty() { return (0.0, 0); }
+        let total: u64 = balances.iter().sum();
+
+        if total == 0 { return (0.0, 0); }
+        balances.sort_unstable_by(|a, b| b.cmp(a));
+        let top10_sum: u64 = balances.iter().take(10).sum();
+        (top10_sum as f64 / total as f64, total)
+    }
+
+    async fn fetch_bundle_and_fresh(&self, mint: &str) -> (f64, f64) {
+        // (sniper_bundle_pct, fresh_wallet_pct)
+        if self.rpc_url.is_empty() { return (0.0, 0.0); }
+
+        // Step 1: Get first 20 transactions for this mint
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [mint, {"limit": 20}]
+        });
+
+        let Ok(resp) = self.http.post(&self.rpc_url).json(&payload).send().await else { return (0.0, 0.0); };
+        let Ok(body) = resp.json::<serde_json::Value>().await else { return (0.0, 0.0); };
+        let sigs = match body["result"].as_array() {
+            Some(s) => s.clone(),
+            None    => return (0.0, 0.0),
+        };
+
+        if sigs.is_empty() { return (0.0, 0.0); }
+        let mut buyer_wallets: Vec<String> = Vec::new();
+        let mut slots: Vec<u64> = Vec::new();
+
+        for sig_entry in sigs.iter().take(20) {
+            let sig = match sig_entry["signature"].as_str() { Some(s) => s, None => continue };
+            let slot = sig_entry["slot"].as_u64().unwrap_or(0);
+            let tx_payload = serde_json::json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTransaction",
+                "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+            });
+            let Ok(tx_resp) = self.http.post(&self.rpc_url).json(&tx_payload).send().await else { continue };
+            let Ok(tx_body) = tx_resp.json::<serde_json::Value>().await else { continue };
+
+            // Extract payer (fee payer = buyer wallet)
+            if let Some(keys) = tx_body["result"]["transaction"]["message"]["accountKeys"].as_array() {
+                if let Some(first) = keys.first() {
+                    if let Some(pk) = first["pubkey"].as_str() {
+                        buyer_wallets.push(pk.to_string());
+                        slots.push(slot);
+                    }
+                }
+            }
+        }
+
+        if buyer_wallets.is_empty() { return (0.0, 0.0); }
+        // Bundle detection: if multiple buys happen within 2 slots, likely coordinated
+        let mut bundle_count = 0usize;
+
+        for i in 1..slots.len() {
+            if slots[i-1].saturating_sub(slots[i]) <= 2 { bundle_count += 1; }
+        }
+
+        let sniper_pct = bundle_count as f64 / buyer_wallets.len() as f64;
+        // Fresh wallet detection: check wallet age via getAccountInfo
+        // A wallet is "fresh" if it has very few transactions (proxy for age)
+        let mut fresh_count = 0usize;
+
+        for wallet in buyer_wallets.iter().take(10) {
+            let age_payload = serde_json::json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getSignaturesForAddress",
+                "params": [wallet, {"limit": 5}]
+            });
+
+            if let Ok(r) = self.http.post(&self.rpc_url).json(&age_payload).send().await {
+                if let Ok(b) = r.json::<serde_json::Value>().await {
+                    if let Some(list) = b["result"].as_array() {
+                        if list.len() < 5 { fresh_count += 1; }
+                    }
+                }
+            }
+        }
+        let fresh_pct = fresh_count as f64 / buyer_wallets.len().min(10) as f64;
+        (sniper_pct, fresh_pct)
     }
 }

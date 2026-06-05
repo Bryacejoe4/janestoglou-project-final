@@ -246,7 +246,7 @@ impl MarketDataClient {
                                 };
                                 let vsr = ru(0);
                                 let vtr = ru(8);
-                                let rsr = ru(16);
+                                let _rsr = ru(16);
                                 let liq   = vsr as f64 / 1e9;
                                 let price = if vtr > 0 {
                                     (vsr as f64 / 1e9) / (vtr as f64 / 1e6)
@@ -269,7 +269,7 @@ impl MarketDataClient {
             (vsr as f64 / 1e9, price)
         });
 
-        //let holder_count = self.fetch_holder_count(mint).await.unwrap_or(1);
+        let holder_count = self.fetch_holder_count(mint).await.unwrap_or(1);
 
         let (quality, holder_count) = tokio::join!(
             self.fetch_launch_quality(mint),
